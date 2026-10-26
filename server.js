@@ -1,8 +1,12 @@
 const http = require('http');
 const { WebSocketServer, WebSocket } = require('ws');
 const { evaluate7 } = require('./poker_eval.js');
+const { computeSidePots } = require('./side_pots.js');
 
 const PORT = process.env.PORT || 8080;
+const MAX_ROOMS = 200;
+const MAX_PLAYERS = 4;
+const IDLE_ROOM_MS = 30 * 60 * 1000; // idle empty-ish lobby rooms are swept
 
 function createStandardDeck() {
   const suits = ['H', 'C', 'D', 'S'];
@@ -29,6 +33,12 @@ function makeRoomCode() {
   return code;
 }
 
+function sanitizeName(raw, fallback) {
+  let n = typeof raw === 'string' ? raw.replace(/[\u0000-\u001F\u007F]/g, '').trim().substring(0, 16) : '';
+  if (!n || n.length === 0) n = fallback || 'Pemain';
+  return n;
+}
+
 const rooms = new Map();
 
 class TableRoom {
@@ -45,20 +55,24 @@ class TableRoom {
     this.turn = -1; // seat number of active player
     this.dealerSeat = 0;
     this.actedInStreet = new Set();
+    this.goneContributed = 0; // contributions of players who left mid-round
+    this.lastTouched = Date.now();
     this.addPlayer(hostWs, hostName, hostChips);
   }
 
   addPlayer(ws, name, chips) {
-    if (this.players.length >= 4) return null;
+    if (this.players.length >= MAX_PLAYERS) return null;
     const seat = this.players.length;
     let initialChips = parseInt(chips, 10);
     if (isNaN(initialChips) || initialChips <= 0) initialChips = 100;
+    initialChips = Math.min(initialChips, 9999999);
     const p = {
       ws,
-      name: name || `Player ${seat + 1}`,
+      name: sanitizeName(name, `Pemain ${seat + 1}`),
       seat,
       chips: initialChips,
-      currentBet: 0,
+      roundContrib: 0,
+      currentBet: Math.min(5, initialChips),
       folded: false,
       allIn: false,
       cards: [],
@@ -73,9 +87,13 @@ class TableRoom {
     if (idx !== -1) {
       const p = this.players[idx];
       const wasRoundActive = (this.phase !== 'lobby' && this.phase !== 'round_over' && this.phase !== 'showdown');
-      if (wasRoundActive && !p.folded) {
-        p.folded = true;
-        p.status = 'Fold';
+      if (wasRoundActive) {
+        if (!p.folded) {
+          p.folded = true;
+          p.status = 'Fold';
+        }
+        // Keep their money in the round's tiers even after they left
+        this.goneContributed += (p.roundContrib || 0);
       }
 
       this.players.splice(idx, 1);
@@ -140,6 +158,7 @@ class TableRoom {
 
   broadcast(obj) {
     const msg = JSON.stringify(obj);
+    this.lastTouched = Date.now();
     for (const p of this.players) {
       if (p.ws && p.ws.readyState === WebSocket.OPEN) {
         p.ws.send(msg);
@@ -148,13 +167,15 @@ class TableRoom {
   }
 
   broadcastState() {
+    this.lastTouched = Date.now();
     for (const p of this.players) {
       if (!p.ws || p.ws.readyState !== WebSocket.OPEN) continue;
 
-      // Anti-cheat: Mask opponent hole cards unless showdown
+      // Anti-cheat: mask opponent hole cards unless showdown revelation applies
       const maskedSeats = this.players.map(pl => {
         const isSelf = (pl.seat === p.seat);
-        const canReveal = (this.phase === 'showdown' || isSelf) && !pl.folded;
+        const canReveal = (isSelf && pl.cards.length > 0) ||
+          (this.phase === 'showdown' && !pl.folded && pl.cards.length > 0);
         return {
           seat: pl.seat,
           name: pl.name,
@@ -164,7 +185,7 @@ class TableRoom {
           allIn: pl.allIn,
           status: pl.status,
           cards: canReveal ? pl.cards : (pl.cards.length ? ['back', 'back'] : []),
-          bestHand: pl.bestHand || null
+          bestHand: (this.phase === 'showdown' && canReveal) ? (pl.bestHand || null) : null
         };
       });
 
@@ -190,21 +211,24 @@ class TableRoom {
 
   startRound() {
     if (this.players.length < 2) return;
+    if (this.phase !== 'lobby' && this.phase !== 'round_over' && this.phase !== 'showdown') return;
     this.roundNumber++;
     this.deck = createStandardDeck();
     this.communityCards = [];
     this.pot = 0;
+    this.goneContributed = 0;
     this.currentBet = this.minBet;
     this.phase = 'bet_preflop';
     this.actedInStreet.clear();
 
     // Reset and deal 2 cards
     for (const p of this.players) {
-      if (p.chips < this.minBet) p.chips = 100; // Bailout reload
+      if (p.chips < 10) p.chips = 10; // minimal stack floor so blinds/raises are playable
       p.cards = [this.deck.pop(), this.deck.pop()];
       p.folded = false;
       p.allIn = false;
       p.currentBet = 0;
+      p.roundContrib = 0;
       p.status = 'Playing';
       p.bestHand = null;
     }
@@ -214,6 +238,7 @@ class TableRoom {
       const blind = Math.min(p.chips, 5);
       p.chips -= blind;
       p.currentBet = blind;
+      p.roundContrib += blind;
       this.pot += blind;
     }
     this.currentBet = 5;
@@ -313,8 +338,11 @@ class TableRoom {
   }
 
   handlePlayerAction(ws, { action, amount }) {
+    if (this.phase === 'lobby' || this.phase === 'round_over') return;
+    if (!String(this.phase).startsWith('bet_')) return;
     const p = this.players.find(pl => pl.ws === ws);
-    if (!p || p.seat !== this.turn || this.phase === 'lobby' || this.phase === 'round_over') return;
+    if (!p || p.folded || p.allIn) return;
+    if (p.seat !== this.turn) return;
 
     const callNeeded = Math.max(0, this.currentBet - p.currentBet);
 
@@ -331,6 +359,7 @@ class TableRoom {
       const act = Math.min(p.chips, callNeeded);
       p.chips -= act;
       p.currentBet += act;
+      p.roundContrib += act;
       this.pot += act;
       if (p.chips === 0) p.allIn = true;
       p.status = `Call $${act}`;
@@ -341,16 +370,18 @@ class TableRoom {
       const spent = Math.min(p.chips, totalCost);
       p.chips -= spent;
       p.currentBet += spent;
+      p.roundContrib += spent;
       this.pot += spent;
       this.currentBet = Math.max(this.currentBet, p.currentBet);
       if (p.chips === 0) p.allIn = true;
-      p.status = `Raise $${raiseAmt}`;
+      p.status = `Raise $${Math.min(spent - callNeeded, spent)}`;
       this.actedInStreet.clear(); // Reset others' obligation to call
       this.actedInStreet.add(p.seat);
     } else if (action === 'allin') {
       const allAmt = p.chips;
       p.chips = 0;
       p.currentBet += allAmt;
+      p.roundContrib += allAmt;
       this.pot += allAmt;
       const raised = p.currentBet > this.currentBet;
       this.currentBet = Math.max(this.currentBet, p.currentBet);
@@ -360,6 +391,8 @@ class TableRoom {
         this.actedInStreet.clear();
       }
       this.actedInStreet.add(p.seat);
+    } else {
+      return; // Unknown action: ignore, do not advance the game
     }
 
     if (this.isStreetComplete()) {
@@ -379,38 +412,69 @@ class TableRoom {
   }
 
   showdown() {
+    if (this.players.length === 0) { this.pot = 0; return; }
     this.phase = 'showdown';
     this.turn = -1;
 
     const contenders = this.players.filter(p => !p.folded);
     for (const c of contenders) {
-      const res = evaluate7(c.cards, this.communityCards);
-      c.score = res.score;
-      c.bestHand = res.name;
+      const res2 = evaluate7(c.cards, this.communityCards);
+      c.score = res2.score;
+      c.bestHand = res2.name;
     }
 
     contenders.sort((a, b) => b.score - a.score);
+
+    // ---- Side-pot aware distribution ----
+    const entries = [];
+    for (const p of this.players) {
+      entries.push({ contrib: p.roundContrib || 0, score: p.score || 0, eligible: !p.folded });
+    }
+    if (this.goneContributed > 0) {
+      entries.push({ contrib: this.goneContributed, score: 0, eligible: false });
+    }
+
+    const potSnapshot = this.pot;
+    const { payouts, leftover } = computeSidePots({ entries, totalPot: this.pot });
+
+    let winnersCount = 1;
     if (contenders.length > 0) {
-      const topScore = contenders[0].score;
+      const topScore = Math.max(...contenders.map(c => c.score || 0));
+      winnersCount = contenders.filter(c => c.score === topScore).length;
+    }
+
+    for (let i = 0; i < this.players.length; i++) {
+      const amt = payouts[i] || 0;
+      const p = this.players[i];
+      if (amt > 0) {
+        p.chips += amt;
+        p.status = (winnersCount > 1 ? `SERI ($${amt})` : `MENANG ($${amt})`);
+      }
+    }
+
+    if (contenders.length > 0) {
+      const topScore = Math.max(...contenders.map(c => c.score || 0));
       const winners = contenders.filter(c => c.score === topScore);
-      const splitPot = Math.floor(this.pot / winners.length);
-      const remainder = this.pot % winners.length;
-      winners.forEach((w, i) => {
-        const payout = splitPot + (i === 0 ? remainder : 0);
-        w.chips += payout;
-        w.status = winners.length > 1 ? `SERI ($${payout})` : `MENANG ($${payout})`;
-      });
       const names = winners.map(w => w.name).join(' & ');
       this.broadcast({
         type: 'event',
         action: 'win',
         message: winners.length > 1
-          ? `SERI! ${names} membagi pot $${this.pot} (${winners[0].bestHand})!`
-          : `${winners[0].name} MENANG POT $${this.pot} dengan ${winners[0].bestHand}!`
+          ? `SERI! ${names} membagi pot $${potSnapshot} (${winners[0].bestHand})!`
+          : `${winners[0].name} MENANG POT $${potSnapshot} dengan ${winners[0].bestHand}!`
       });
-      this.pot = 0;
     }
 
+    if (leftover > 0) {
+      // Uncalled excess: return to the biggest contributor still seated
+      let maxP = null;
+      for (const p of this.players) {
+        if (!maxP || (p.roundContrib || 0) > (maxP.roundContrib || 0)) maxP = p;
+      }
+      if (maxP) maxP.chips += leftover;
+    }
+
+    this.pot = 0;
     this.dealerSeat = (this.dealerSeat + 1) % this.players.length;
     this.broadcastState();
   }
@@ -421,33 +485,54 @@ const server = http.createServer((req, res) => {
     'Content-Type': 'application/json',
     'Access-Control-Allow-Origin': '*'
   });
-  res.end(JSON.stringify({ status: 'ok', rooms: rooms.size }));
+  res.end(JSON.stringify({ status: 'ok', rooms: rooms.size, version: '2.0-sidepots' }));
 });
 
 const wss = new WebSocketServer({ server });
 
 wss.on('connection', (ws) => {
   let currentRoom = null;
+  let msgCount = 0;
+  let msgWindow = Date.now();
 
   ws.on('message', (raw) => {
+    const now = Date.now();
+    if (now - msgWindow > 2000) { msgWindow = now; msgCount = 0; }
+    msgCount++;
+    if (msgCount > 40 || raw.length > 8192) return; // flood guard
+
     try {
       const data = JSON.parse(raw);
       if (data.type === 'create_room') {
+        // A socket can never sit in two rooms at once
+        if (currentRoom) {
+          currentRoom.removePlayer(ws);
+          currentRoom = null;
+        }
+        if (rooms.size >= MAX_ROOMS) {
+          ws.send(JSON.stringify({ type: 'error', message: 'Server penuh! Coba lagi beberapa saat.' }));
+          return;
+        }
         let code = makeRoomCode();
-        while (rooms.has(code)) code = makeRoomCode();
+        let guard = 0;
+        while (rooms.has(code) && guard++ < 50) code = makeRoomCode();
         const r = new TableRoom(code, ws, data.name, data.chips);
         rooms.set(code, r);
         currentRoom = r;
         ws.send(JSON.stringify({ type: 'joined', room: code, isHost: true }));
         r.broadcastState();
       } else if (data.type === 'join_room') {
+        if (currentRoom) {
+          currentRoom.removePlayer(ws);
+          currentRoom = null;
+        }
         const code = (data.room || '').trim().toUpperCase();
         const r = rooms.get(code);
         if (!r) {
           ws.send(JSON.stringify({ type: 'error', message: 'Room tidak ditemukan!' }));
           return;
         }
-        if (r.players.length >= 4) {
+        if (r.players.length >= MAX_PLAYERS) {
           ws.send(JSON.stringify({ type: 'error', message: 'Meja sudah penuh (maks 4)!' }));
           return;
         }
@@ -457,35 +542,45 @@ wss.on('connection', (ws) => {
           ws.send(JSON.stringify({ type: 'joined', room: code, isHost: false }));
           r.broadcastState();
         }
-      } else if (data.type === 'start_game') {
-        if (currentRoom && currentRoom.players[0].ws === ws) {
-          currentRoom.startRound();
-        }
-      } else if (data.type === 'new_round') {
-        if (currentRoom && currentRoom.players[0].ws === ws) {
-          currentRoom.startRound();
+      } else if (data.type === 'start_game' || data.type === 'new_round') {
+        if (currentRoom && currentRoom.players.length > 0 && currentRoom.players[0].ws === ws) {
+          // 'showdown' is a frozen end-state (the server never auto-advances it),
+          // so the host must be able to start the next round from there too.
+          const canStart = currentRoom.phase === 'lobby' || currentRoom.phase === 'round_over' || currentRoom.phase === 'showdown';
+          if (!canStart) {
+            ws.send(JSON.stringify({ type: 'error', message: 'Ronde masih berjalan!' }));
+          } else if (currentRoom.players.length < 2) {
+            ws.send(JSON.stringify({ type: 'error', message: 'Minimal 2 pemain untuk mulai!' }));
+          } else {
+            currentRoom.startRound();
+          }
         }
       } else if (data.type === 'action') {
         if (currentRoom) currentRoom.handlePlayerAction(ws, data);
       } else if (data.type === 'set_name') {
         if (currentRoom && currentRoom.phase === 'lobby') {
           const pl = currentRoom.players.find(p => p.ws === ws);
-          if (pl && data.name && typeof data.name === 'string') {
-            const cleanName = data.name.trim().substring(0, 16);
-            if (cleanName.length > 0) {
+          if (pl) {
+            const cleanName = sanitizeName(data.name, pl.name);
+            if (cleanName !== pl.name) {
               pl.name = cleanName;
               currentRoom.broadcastState();
             }
           }
         }
       } else if (data.type === 'chat') {
+        // Authority: seat & name always come from the server-side player record,
+        // never from the client payload (anti-spoofing).
         if (currentRoom) {
-          currentRoom.broadcast({
-            type: 'chat',
-            seat: data.seat,
-            name: data.name,
-            text: data.text
-          });
+          const pl = currentRoom.players.find(p => p.ws === ws);
+          if (pl) {
+            const text = typeof data.text === 'string'
+              ? data.text.replace(/[\u0000-\u001F\u007F]/g, '').substring(0, 120)
+              : '';
+            if (text.length > 0) {
+              currentRoom.broadcast({ type: 'chat', seat: pl.seat, name: pl.name, text });
+            }
+          }
         }
       } else if (data.type === 'leave_room') {
         if (currentRoom) {
@@ -505,6 +600,28 @@ wss.on('connection', (ws) => {
   });
 });
 
-server.listen(PORT, () => {
-  console.log(`[Balatro Server] Running on http://localhost:${PORT} (WS on ws://localhost:${PORT})`);
-});
+function start() {
+  server.listen(PORT, () => {
+    console.log(`[Balatro Server] Running on http://localhost:${PORT} (WS on ws://localhost:${PORT})`);
+  });
+  // Housekeeping: sweep idle rooms that would otherwise leak memory forever
+  setInterval(() => {
+    const now = Date.now();
+    for (const [code, r] of rooms) {
+      if (r.players.length <= 1 && (now - (r.lastTouched || now)) > IDLE_ROOM_MS) {
+        for (const p of r.players) {
+          try { p.ws.send(JSON.stringify({ type: 'error', message: 'Meja ditutup karena tidak aktif.' })); } catch (e2) {}
+        }
+        rooms.delete(code);
+        console.log(`[Balatro Server] Swept idle room ${code}`);
+      }
+    }
+  }, 60 * 1000);
+}
+
+if (require.main === module) {
+  start();
+}
+
+// Allow deterministic unit-testing; app.js entrypoint calls start()
+module.exports = { TableRoom, rooms, makeRoomCode, sanitizeName, start };
