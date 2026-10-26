@@ -478,14 +478,10 @@ wss.on('connection', (ws) => {
             }
           }
         }
-      } else if (data.type === 'chat') {
+      } else if (data.type === 'leave_room') {
         if (currentRoom) {
-          currentRoom.broadcast({
-            type: 'chat',
-            seat: data.seat,
-            name: data.name,
-            text: data.text
-          });
+          currentRoom.removePlayer(ws);
+          currentRoom = null;
         }
       }
     } catch (e) {
