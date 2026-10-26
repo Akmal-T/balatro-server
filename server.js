@@ -478,6 +478,15 @@ wss.on('connection', (ws) => {
             }
           }
         }
+      } else if (data.type === 'chat') {
+        if (currentRoom) {
+          currentRoom.broadcast({
+            type: 'chat',
+            seat: data.seat,
+            name: data.name,
+            text: data.text
+          });
+        }
       } else if (data.type === 'leave_room') {
         if (currentRoom) {
           currentRoom.removePlayer(ws);
