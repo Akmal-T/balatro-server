@@ -1,0 +1,12 @@
+{
+  "name": "balatro-classic-server",
+  "version": "1.0.0",
+  "description": "Authoritative multiplayer server for Balatro Classic Modes",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "dependencies": {
+    "ws": "^8.18.0"
+  }
+}
