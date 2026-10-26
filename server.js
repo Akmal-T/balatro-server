@@ -464,6 +464,17 @@ wss.on('connection', (ws) => {
         }
       } else if (data.type === 'action') {
         if (currentRoom) currentRoom.handlePlayerAction(ws, data);
+      } else if (data.type === 'set_name') {
+        if (currentRoom && currentRoom.phase === 'lobby') {
+          const pl = currentRoom.players.find(p => p.ws === ws);
+          if (pl && data.name && typeof data.name === 'string') {
+            const cleanName = data.name.trim().substring(0, 16);
+            if (cleanName.length > 0) {
+              pl.name = cleanName;
+              currentRoom.broadcastState();
+            }
+          }
+        }
       } else if (data.type === 'chat') {
         if (currentRoom) {
           currentRoom.broadcast({
