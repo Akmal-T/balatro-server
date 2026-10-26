@@ -7,7 +7,7 @@ RUN npm install --production
 
 COPY . .
 
-ENV PORT=7860
-EXPOSE 7860
+ENV PORT=8080
+EXPOSE 8080
 
 CMD ["node", "server.js"]
