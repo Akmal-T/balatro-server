@@ -34,6 +34,7 @@ const rooms = new Map();
 class TableRoom {
   constructor(code, hostWs, hostName, hostChips) {
     this.code = code;
+    this.roundNumber = 0;
     this.players = [];
     this.deck = [];
     this.communityCards = [];
@@ -170,6 +171,7 @@ class TableRoom {
       const payload = {
         type: 'state',
         room: this.code,
+        round: this.roundNumber,
         phase: this.phase,
         pot: this.pot,
         currentBet: this.currentBet,
@@ -188,6 +190,7 @@ class TableRoom {
 
   startRound() {
     if (this.players.length < 2) return;
+    this.roundNumber++;
     this.deck = createStandardDeck();
     this.communityCards = [];
     this.pot = 0;
